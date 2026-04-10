@@ -1,72 +1,75 @@
-import os
 import yfinance as yf
 import pandas as pd
+import pandas_ta as ta
 import requests
-from datetime import datetime
+import time
 
-# Pulls tokens from GitHub Secrets
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+# --- CONFIGURATION ---
+SYMBOL = "GC=F" # Gold Futures (Use BTC-USD for Bitcoin, EURUSD=X for Euro)
+TOKEN = "8792463504:AAFgMsp66g6d4MrJuCscLZDh1Mik4CwkTvs"
+CHAT_ID = "5549364804"
+RR_RATIO = 4
+BIG_CANDLE_MULT = 1.2
+EMA_PERIOD = 9
+ZONE_THRESHOLD = 0.002 # 0.2% distance from weekly level
 
-def send_telegram_alert(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    requests.post(url, json=payload)
+def send_telegram(message):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage?chat_id={CHAT_ID}&text={message}&parse_mode=Markdown"
+    requests.get(url)
 
-def main():
-    ticker = "EURUSD=X"
-    df = yf.download(ticker, period="30d", interval="1h", progress=False)
+def get_data():
+    # 1. Get Weekly Levels (HTF)
+    weekly_data = yf.download(SYMBOL, period="2wk", interval="1wk")
+    if len(weekly_data) < 2: return None
     
-    # Flatten columns
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0].lower() for c in df.columns]
-    else:
-        df.columns = [c.lower() for c in df.columns]
+    last_week = weekly_data.iloc[-2] # The completed previous week
+    w_high = last_week['High']
+    w_low = last_week['Low']
 
-    # Institutional Levels
-    wh = df['high'].resample('W').max().ffill().bfill().iloc[-1]
-    wl = df['low'].resample('W').min().ffill().bfill().iloc[-1]
-    dh = df['high'].resample('D').max().ffill().bfill().iloc[-1]
-    dl = df['low'].resample('D').min().ffill().bfill().iloc[-1]
+    # 2. Get 15m Data (LTF)
+    ltf_data = yf.download(SYMBOL, period="2d", interval="15m")
+    ltf_data['ema'] = ta.ema(ltf_data['Close'], length=EMA_PERIOD)
     
-    # RSI
-    delta = df['close'].diff()
-    gain = delta.where(delta > 0, 0).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    df['rsi'] = 100 - (100 / (1 + (gain / loss)))
+    return ltf_data, w_high, w_low
+
+def check_strategy():
+    data, w_high, w_low = get_data()
     
-    curr = df.iloc[-1]
-    price = curr['close']
-    rrr = 2.5
-    buffer = 0.0010
+    # Get last two completed 15m candles
+    current = data.iloc[-1]
+    prev = data.iloc[-2]
+    lookback = data.iloc[-20:-1] # Look back 20 candles for the "Sweep"
+
+    # Logic Variables
+    body_size = abs(prev['Close'] - prev['Open'])
+    avg_body = abs(data['Close'] - data['Open']).tail(10).mean()
     
-    # Bullish Setup
-    is_at_support = (curr['low'] <= wl or curr['low'] <= dl)
-    if is_at_support and curr['close'] > curr['open'] and curr['rsi'] < 35:
-        sl = curr['low'] - buffer
-        tp = price + ((price - sl) * rrr)
-        send_telegram_alert(
-            f"🟢 *BULLISH REVERSAL SETUP (EUR/USD)*\n"
-            f"Entry: `{price:.5f}`\n"
-            f"Stop Loss: `{sl:.5f}`\n"
-            f"Take Profit: `{tp:.5f}`\n"
-            f"RSI: `{curr['rsi']:.1f}`\n\n"
-            f"💡 *Action:* Open Long on MT5"
-        )
-    
-    # Bearish Setup
-    is_at_resist = (curr['high'] >= wh or curr['high'] >= dh)
-    if is_at_resist and curr['close'] < curr['open'] and curr['rsi'] > 65:
-        sl = curr['high'] + buffer
-        tp = price - ((sl - price) * rrr)
-        send_telegram_alert(
-            f"🔴 *BEARISH REVERSAL SETUP (EUR/USD)*\n"
-            f"Entry: `{price:.5f}`\n"
-            f"Stop Loss: `{sl:.5f}`\n"
-            f"Take Profit: `{tp:.5f}`\n"
-            f"RSI: `{curr['rsi']:.1f}`\n\n"
-            f"💡 *Action:* Open Short on MT5"
-        )
+    is_big_player = body_size > (avg_body * BIG_CANDLE_MULT)
+    low_swept = any(lookback['Low'] < w_low)
+    high_swept = any(lookback['High'] > w_high)
+
+    # --- BUY SIGNAL ---
+    # Low swept recently + Prev candle Bullish + Big Player + Above EMA
+    if low_swept and prev['Close'] > prev['Open'] and is_big_player and prev['Close'] > prev['ema']:
+        sl = prev['Low'] - (prev['Low'] * 0.001)
+        risk = prev['Close'] - sl
+        tp = prev['Close'] + (risk * RR_RATIO)
+        
+        msg = f"🚀 *BUY SIGNAL: {SYMBOL}*\nEntry: {prev['Close']:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f}\nRRR: 1:{RR_RATIO}"
+        send_telegram(msg)
+        print("Buy Signal Sent")
+
+    # --- SELL SIGNAL ---
+    # High swept recently + Prev candle Bearish + Big Player + Below EMA
+    elif high_swept and prev['Close'] < prev['Open'] and is_big_player and prev['Close'] < prev['ema']:
+        sl = prev['High'] + (prev['High'] * 0.001)
+        risk = sl - prev['Close']
+        tp = prev['Close'] - (risk * RR_RATIO)
+        
+        msg = f"🔻 *SELL SIGNAL: {SYMBOL}*\nEntry: {prev['Close']:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f}\nRRR: 1:{RR_RATIO}"
+        send_telegram(msg)
+        print("Sell Signal Sent")
 
 if __name__ == "__main__":
-    main()
+    print("Bot is checking for Turning Points...")
+    check_strategy()
